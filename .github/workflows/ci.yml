@@ -1,0 +1,138 @@
+name: CI/CD Backend Tienda
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: Integración continua
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: tienda_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d tienda_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      NODE_ENV: test
+      PORT: 5050
+      API_VERSION: v1
+      DB_HOST: 127.0.0.1
+      DB_PORT: 5432
+      DB_NAME: tienda_test
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_SSL: "false"
+      CORS_ORIGINS: http://localhost:3000
+      JSON_LIMIT: 1mb
+      PAGINATION_DEFAULT_LIMIT: 10
+      PAGINATION_MAX_LIMIT: 100
+      RATE_LIMIT_WINDOW_MS: 900000
+      RATE_LIMIT_MAX: 1000
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Auditar dependencias
+        run: npm audit --audit-level=high
+
+      - name: Verificar sintaxis
+        run: find . -path ./node_modules -prune -o -name '*.js' -print0 | xargs -0 -n1 node --check
+
+      - name: Preparar base de datos
+        run: PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -d tienda_test -f database/schema.sql
+
+      - name: Ejecutar pruebas de integración
+        run: |
+          npm start > server.log 2>&1 &
+          SERVER_PID=$!
+          READY=0
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:5050/api/v1/health > /dev/null; then
+              READY=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$READY" -ne 1 ]; then
+            echo "El servidor no respondió a tiempo"
+            cat server.log
+            kill "$SERVER_PID" || true
+            exit 1
+          fi
+
+          set +e
+          npm run test:api
+          TEST_STATUS=$?
+          set -e
+
+          kill "$SERVER_PID" || true
+          wait "$SERVER_PID" 2>/dev/null || true
+          cat server.log
+          exit "$TEST_STATUS"
+
+      - name: Guardar log del servidor si falla
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-log
+          path: server.log
+          if-no-files-found: ignore
+
+  package:
+    name: Entrega de artefacto
+    runs-on: ubuntu-latest
+    needs: ci
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Crear paquete del backend
+        run: |
+          tar -czf backend-release.tar.gz \
+            --exclude=node_modules \
+            --exclude=.git \
+            --exclude=.env \
+            --exclude='*.log' \
+            .
+
+      - name: Publicar artefacto en Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-release
+          path: backend-release.tar.gz
+          retention-days: 14
